@@ -1,649 +1,1430 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 
-#define FASTLED_INTERNAL
-#include <FastLED.h>
+// =====================================================
+// HARDWARE CONFIG
+// =====================================================
 
-// ================= USER CONFIG =================
+#define MAX_DIN_PIN 13
+#define MAX_CLK_PIN 14
+#define MAX_CS_PIN  15
 
-#define DATA_PIN 13                 // WS2812 data pin
-#define COLOR_ORDER GRB
-#define LED_TYPE WS2812B
+#define NUM_MODULES 14
+#define ROWS_PER_MODULE 8
+#define BYTES_PER_FRAME (NUM_MODULES * ROWS_PER_MODULE)
 
-#define MATRIX_W 8
-#define MATRIX_H 8
-#define LEDS_PER_MATRIX 64
-#define NUM_MATRICES 11
-#define TOTAL_LEDS (NUM_MATRICES * LEDS_PER_MATRIX)
+#define WEB_PORT 8080
 
-// Most 8x8 WS2812 panels are wired serpentine.
-// If your image looks wrong, change this to false.
-#define SERPENTINE_MATRIX true
+// If display is mirrored/flipped, change these first.
+#define MODULE_MIRROR_X false
+#define MODULE_MIRROR_Y false
 
-// Set this to match your power supply.
-// 704 LEDs at full white can draw a lot; do not power LEDs from the ESP32.
-#define MAX_POWER_MILLIAMPS 10000
+// MAX7219 intensity: 0-15
+uint8_t globalIntensity = 3;
 
+// WiFi AP
 const char *AP_SSID = "esp32";
-const char *AP_PASS = "protohead123"; // must be 8+ chars, or use "" for open AP
+const char *AP_PASS = "protogen123"; // 8+ chars
 
-const uint16_t WEB_PORT = 8080;
+// Animation limits
+#define MAX_FRAMES 80
+#define MAX_NAME_LEN 31
 
-// =================================================
+// =====================================================
+// MODULE ORDER
+// =====================================================
+//
+// Daisy-chain order:
+//
+// 0  = Left mouth 1
+// 1  = Left mouth 2
+// 2  = Left mouth 3
+//
+// 3  = Right mouth 1
+// 4  = Right mouth 2
+// 5  = Right mouth 3
+//
+// 6  = Left eye 1
+// 7  = Left eye 2
+//
+// 8  = Right eye 1
+// 9  = Right eye 2
+//
+// 10 = Left ear
+// 11 = Right ear
+//
+// 12 = Left nose
+// 13 = Right nose
+//
+// Wiring:
+// ESP32 GPIO13 -> DIN module 0
+// ESP32 GPIO14 -> CLK all modules
+// ESP32 GPIO15 -> CS/LOAD all modules
+// Module 0 DOUT -> Module 1 DIN -> ... -> Module 13 DIN
+//
+// =====================================================
 
-CRGB leds[TOTAL_LEDS];
+// =====================================================
+// MAX7219 REGISTERS
+// =====================================================
 
-enum LedMode : uint8_t {
-  MODE_OFF = 0,
-  MODE_SOLID,
-  MODE_RAINBOW,
-  MODE_CHECKER,
-  MODE_WIPE,
-  MODE_CUSTOM
-};
+#define MAX_REG_NOOP        0x00
+#define MAX_REG_DIGIT0      0x01
+#define MAX_REG_DECODEMODE  0x09
+#define MAX_REG_INTENSITY   0x0A
+#define MAX_REG_SCANLIMIT   0x0B
+#define MAX_REG_SHUTDOWN    0x0C
+#define MAX_REG_DISPLAYTEST 0x0F
 
-struct MatrixState {
-  LedMode mode;
-  CRGB color;
-  uint8_t brightness;  // 0-255
-  uint16_t speedMs;    // animation delay
-  bool dirty;
-};
-
-MatrixState matrixState[NUM_MATRICES];
-CRGB customPixels[NUM_MATRICES][LEDS_PER_MATRIX];
-
-uint32_t lastDrawMs[NUM_MATRICES];
-uint16_t frameCounter[NUM_MATRICES];
+// =====================================================
+// GLOBAL STATE
+// =====================================================
 
 WebServer server(WEB_PORT);
 
-// ================= WEB UI =================
+uint8_t displayFrame[BYTES_PER_FRAME];
+
+uint8_t animFrames[MAX_FRAMES][BYTES_PER_FRAME];
+uint16_t animFrameCount = 0;
+uint16_t animFrameMs = 125;
+bool animLoop = true;
+bool animPlaying = false;
+uint16_t animIndex = 0;
+uint32_t lastAnimMs = 0;
+String currentAnimName = "";
+
+String defaultAnimName = "";
+
+// =====================================================
+// BASIC HELPERS
+// =====================================================
+
+uint8_t reverseByte(uint8_t b) {
+  b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+  b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+  b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+  return b;
+}
+
+bool isSafeName(const String &s) {
+  if (s.length() == 0 || s.length() > MAX_NAME_LEN) return false;
+
+  for (uint16_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    bool ok =
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '_' ||
+      c == '-';
+
+    if (!ok) return false;
+  }
+
+  return true;
+}
+
+String animPath(const String &name) {
+  return "/anim_" + name + ".json";
+}
+
+int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+  if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+  return -1;
+}
+
+bool hexToFrame(const String &hex, uint8_t *out) {
+  if (hex.length() != BYTES_PER_FRAME * 2) {
+    return false;
+  }
+
+  for (uint16_t i = 0; i < BYTES_PER_FRAME; i++) {
+    int hi = hexVal(hex[i * 2]);
+    int lo = hexVal(hex[i * 2 + 1]);
+
+    if (hi < 0 || lo < 0) return false;
+
+    out[i] = (hi << 4) | lo;
+  }
+
+  return true;
+}
+
+String frameToHex(const uint8_t *frame) {
+  const char *digits = "0123456789ABCDEF";
+  String out;
+  out.reserve(BYTES_PER_FRAME * 2);
+
+  for (uint16_t i = 0; i < BYTES_PER_FRAME; i++) {
+    out += digits[(frame[i] >> 4) & 0x0F];
+    out += digits[frame[i] & 0x0F];
+  }
+
+  return out;
+}
+
+// =====================================================
+// MAX7219 LOW LEVEL
+// =====================================================
+
+void maxClockBit(bool bitVal) {
+  digitalWrite(MAX_CLK_PIN, LOW);
+  digitalWrite(MAX_DIN_PIN, bitVal ? HIGH : LOW);
+  digitalWrite(MAX_CLK_PIN, HIGH);
+}
+
+void maxSend16(uint8_t reg, uint8_t data) {
+  uint16_t packet = ((uint16_t)reg << 8) | data;
+
+  for (int8_t i = 15; i >= 0; i--) {
+    maxClockBit(packet & (1 << i));
+  }
+}
+
+void maxSendAll(uint8_t reg, uint8_t data) {
+  digitalWrite(MAX_CS_PIN, LOW);
+
+  for (int8_t m = NUM_MODULES - 1; m >= 0; m--) {
+    maxSend16(reg, data);
+  }
+
+  digitalWrite(MAX_CS_PIN, HIGH);
+}
+
+void maxClear() {
+  memset(displayFrame, 0, sizeof(displayFrame));
+
+  for (uint8_t row = 0; row < 8; row++) {
+    digitalWrite(MAX_CS_PIN, LOW);
+
+    for (int8_t m = NUM_MODULES - 1; m >= 0; m--) {
+      maxSend16(MAX_REG_DIGIT0 + row, 0x00);
+    }
+
+    digitalWrite(MAX_CS_PIN, HIGH);
+  }
+}
+
+void maxShowFrame(const uint8_t *frame) {
+  for (uint8_t hwRow = 0; hwRow < 8; hwRow++) {
+    digitalWrite(MAX_CS_PIN, LOW);
+
+    for (int8_t m = NUM_MODULES - 1; m >= 0; m--) {
+      uint8_t logicalRow = MODULE_MIRROR_Y ? (7 - hwRow) : hwRow;
+      uint8_t data = frame[m * 8 + logicalRow];
+
+      if (MODULE_MIRROR_X) {
+        data = reverseByte(data);
+      }
+
+      maxSend16(MAX_REG_DIGIT0 + hwRow, data);
+    }
+
+    digitalWrite(MAX_CS_PIN, HIGH);
+  }
+}
+
+void maxInit() {
+  pinMode(MAX_DIN_PIN, OUTPUT);
+  pinMode(MAX_CLK_PIN, OUTPUT);
+  pinMode(MAX_CS_PIN, OUTPUT);
+
+  digitalWrite(MAX_CS_PIN, HIGH);
+  digitalWrite(MAX_CLK_PIN, LOW);
+
+  delay(100);
+
+  maxSendAll(MAX_REG_SHUTDOWN, 0x00);
+  maxSendAll(MAX_REG_DISPLAYTEST, 0x00);
+  maxSendAll(MAX_REG_DECODEMODE, 0x00);
+  maxSendAll(MAX_REG_SCANLIMIT, 0x07);
+  maxSendAll(MAX_REG_INTENSITY, globalIntensity);
+  maxSendAll(MAX_REG_SHUTDOWN, 0x01);
+
+  maxClear();
+}
+
+// =====================================================
+// FILE STORAGE
+// =====================================================
+
+void loadDefaultName() {
+  defaultAnimName = "";
+
+  if (!LittleFS.exists("/default.txt")) {
+    return;
+  }
+
+  File f = LittleFS.open("/default.txt", "r");
+  if (!f) return;
+
+  defaultAnimName = f.readString();
+  defaultAnimName.trim();
+
+  f.close();
+
+  if (!isSafeName(defaultAnimName)) {
+    defaultAnimName = "";
+  }
+}
+
+void saveDefaultName(const String &name) {
+  File f = LittleFS.open("/default.txt", "w");
+  if (!f) return;
+
+  f.print(name);
+  f.close();
+
+  defaultAnimName = name;
+}
+
+bool loadAnimation(const String &name) {
+  if (!isSafeName(name)) return false;
+
+  String path = animPath(name);
+
+  if (!LittleFS.exists(path)) {
+    return false;
+  }
+
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+
+  if (err) {
+    Serial.print("JSON load error: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  int fps = doc["fps"] | 8;
+  fps = constrain(fps, 1, 60);
+
+  bool loopVal = doc["loop"] | true;
+
+  JsonArray frames = doc["frames"].as<JsonArray>();
+  if (frames.isNull() || frames.size() == 0 || frames.size() > MAX_FRAMES) {
+    return false;
+  }
+
+  uint16_t count = 0;
+
+  for (JsonVariant v : frames) {
+    const char *hex = v.as<const char *>();
+    if (!hex) return false;
+
+    if (!hexToFrame(String(hex), animFrames[count])) {
+      return false;
+    }
+
+    count++;
+  }
+
+  animFrameCount = count;
+  animFrameMs = 1000 / fps;
+  animLoop = loopVal;
+  animIndex = 0;
+  currentAnimName = name;
+
+  memcpy(displayFrame, animFrames[0], BYTES_PER_FRAME);
+  maxShowFrame(displayFrame);
+
+  return true;
+}
+
+// =====================================================
+// HTTP HELPERS
+// =====================================================
+
+void sendText(int code, const String &msg) {
+  server.send(code, "text/plain", msg);
+}
+
+void handleApiList() {
+  String json = "{";
+  json += "\"animations\":[";
+
+  bool first = true;
+
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+
+  while (file) {
+    String fname = String(file.name());
+
+    if (fname.startsWith("/")) {
+      fname.remove(0, 1);
+    }
+
+    if (fname.startsWith("anim_") && fname.endsWith(".json")) {
+      String name = fname.substring(5, fname.length() - 5);
+
+      if (!first) json += ",";
+      first = false;
+
+      json += "\"";
+      json += name;
+      json += "\"";
+    }
+
+    file = root.openNextFile();
+  }
+
+  json += "],";
+  json += "\"default\":\"" + defaultAnimName + "\",";
+  json += "\"current\":\"" + currentAnimName + "\",";
+  json += "\"playing\":";
+  json += animPlaying ? "true" : "false";
+  json += ",";
+  json += "\"intensity\":";
+  json += globalIntensity;
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleApiLoad() {
+  if (!server.hasArg("name")) {
+    sendText(400, "Missing name");
+    return;
+  }
+
+  String name = server.arg("name");
+
+  if (!isSafeName(name)) {
+    sendText(400, "Bad name. Use only letters, numbers, underscore, or dash.");
+    return;
+  }
+
+  String path = animPath(name);
+
+  if (!LittleFS.exists(path)) {
+    sendText(404, "Animation not found");
+    return;
+  }
+
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    sendText(500, "Could not open file");
+    return;
+  }
+
+  server.streamFile(f, "application/json");
+  f.close();
+}
+
+void handleApiSave() {
+  String body = server.arg("plain");
+
+  if (body.length() == 0) {
+    sendText(400, "Empty body");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+
+  if (err) {
+    sendText(400, String("Bad JSON: ") + err.c_str());
+    return;
+  }
+
+  String name = doc["name"] | "";
+
+  if (!isSafeName(name)) {
+    sendText(400, "Bad name. Use only letters, numbers, underscore, or dash.");
+    return;
+  }
+
+  int fps = doc["fps"] | 8;
+  fps = constrain(fps, 1, 60);
+
+  JsonArray frames = doc["frames"].as<JsonArray>();
+
+  if (frames.isNull() || frames.size() == 0) {
+    sendText(400, "No frames");
+    return;
+  }
+
+  if (frames.size() > MAX_FRAMES) {
+    sendText(400, "Too many frames");
+    return;
+  }
+
+  uint8_t testFrame[BYTES_PER_FRAME];
+
+  for (JsonVariant v : frames) {
+    const char *hex = v.as<const char *>();
+    if (!hex || !hexToFrame(String(hex), testFrame)) {
+      sendText(400, "Bad frame hex data");
+      return;
+    }
+  }
+
+  String path = animPath(name);
+  File f = LittleFS.open(path, "w");
+
+  if (!f) {
+    sendText(500, "Could not write file");
+    return;
+  }
+
+  serializeJson(doc, f);
+  f.close();
+
+  loadAnimation(name);
+  animPlaying = false;
+
+  sendText(200, "Saved");
+}
+
+void handleApiPlay() {
+  if (!server.hasArg("name")) {
+    sendText(400, "Missing name");
+    return;
+  }
+
+  String name = server.arg("name");
+
+  if (!loadAnimation(name)) {
+    sendText(400, "Could not load animation");
+    return;
+  }
+
+  animPlaying = true;
+  animIndex = 0;
+  lastAnimMs = millis();
+
+  sendText(200, "Playing");
+}
+
+void handleApiStop() {
+  animPlaying = false;
+  sendText(200, "Stopped");
+}
+
+void handleApiDefault() {
+  if (!server.hasArg("name")) {
+    sendText(400, "Missing name");
+    return;
+  }
+
+  String name = server.arg("name");
+
+  if (!isSafeName(name)) {
+    sendText(400, "Bad name");
+    return;
+  }
+
+  if (!LittleFS.exists(animPath(name))) {
+    sendText(404, "Animation not found");
+    return;
+  }
+
+  saveDefaultName(name);
+  sendText(200, "Default set");
+}
+
+void handleApiDelete() {
+  if (!server.hasArg("name")) {
+    sendText(400, "Missing name");
+    return;
+  }
+
+  String name = server.arg("name");
+
+  if (!isSafeName(name)) {
+    sendText(400, "Bad name");
+    return;
+  }
+
+  String path = animPath(name);
+
+  if (!LittleFS.exists(path)) {
+    sendText(404, "Animation not found");
+    return;
+  }
+
+  LittleFS.remove(path);
+
+  if (defaultAnimName == name) {
+    saveDefaultName("");
+  }
+
+  if (currentAnimName == name) {
+    currentAnimName = "";
+    animPlaying = false;
+    animFrameCount = 0;
+    memset(displayFrame, 0, BYTES_PER_FRAME);
+    maxShowFrame(displayFrame);
+  }
+
+  sendText(200, "Deleted");
+}
+
+void handleApiPreview() {
+  if (!server.hasArg("frame")) {
+    sendText(400, "Missing frame");
+    return;
+  }
+
+  String hex = server.arg("frame");
+
+  if (!hexToFrame(hex, displayFrame)) {
+    sendText(400, "Bad frame data");
+    return;
+  }
+
+  animPlaying = false;
+  maxShowFrame(displayFrame);
+
+  sendText(200, "Previewed");
+}
+
+void handleApiIntensity() {
+  if (!server.hasArg("value")) {
+    sendText(400, "Missing value");
+    return;
+  }
+
+  int v = server.arg("value").toInt();
+  globalIntensity = constrain(v, 0, 15);
+  maxSendAll(MAX_REG_INTENSITY, globalIntensity);
+
+  sendText(200, "Intensity set");
+}
+
+// =====================================================
+// WEB UI
+// =====================================================
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>ESP32 LED Matrix Controller</title>
+  <title>Protogen MAX7219 Head</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body {
-      font-family: Arial, sans-serif;
-      background: #111;
+      background: #101010;
       color: #eee;
+      font-family: Arial, sans-serif;
       margin: 0;
-      padding: 18px;
+      padding: 16px;
     }
-    h1 { margin-top: 0; }
-    .top, .card {
+
+    h1, h2, h3 {
+      margin-top: 0;
+    }
+
+    .card {
       background: #1b1b1b;
       border: 1px solid #333;
       border-radius: 12px;
       padding: 14px;
       margin-bottom: 14px;
     }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
-      gap: 14px;
-    }
-    label {
-      display: block;
-      margin-top: 8px;
-      font-size: 14px;
-      color: #ccc;
-    }
-    input, select, button {
-      width: 100%;
-      box-sizing: border-box;
-      margin-top: 4px;
-      padding: 8px;
-      border-radius: 8px;
-      border: 1px solid #444;
-      background: #222;
+
+    button, input, select {
+      background: #242424;
       color: #eee;
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 8px;
+      margin: 4px;
     }
-    input[type=color] {
-      height: 42px;
-      padding: 3px;
-    }
+
     button {
       cursor: pointer;
-      background: #2c5aff;
+      background: #2d5cff;
       border: none;
-      margin-top: 10px;
       font-weight: bold;
     }
+
     button.secondary {
       background: #444;
     }
-    .pixels {
-      display: grid;
-      grid-template-columns: repeat(8, 20px);
-      grid-template-rows: repeat(8, 20px);
-      gap: 3px;
-      margin-top: 10px;
-      user-select: none;
+
+    button.danger {
+      background: #a82121;
     }
+
+    button.active {
+      background: #00a86b;
+    }
+
+    input[type=range] {
+      width: 180px;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    .groups button {
+      min-width: 120px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 3px;
+      width: max-content;
+      margin-top: 10px;
+      touch-action: none;
+    }
+
     .px {
-      width: 20px;
-      height: 20px;
+      width: 22px;
+      height: 22px;
       background: #050505;
       border: 1px solid #333;
       border-radius: 4px;
-      cursor: pointer;
+      user-select: none;
     }
-    .hint {
+
+    .px.on {
+      background: #00e676;
+      box-shadow: 0 0 8px #00e676;
+    }
+
+    .frameList {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .frameBtn {
+      background: #444;
+      min-width: 40px;
+    }
+
+    .frameBtn.active {
+      background: #00a86b;
+    }
+
+    .small {
       color: #aaa;
       font-size: 13px;
-      line-height: 1.4;
+    }
+
+    .status {
+      color: #8fd18f;
+      font-size: 14px;
+      min-height: 18px;
+    }
+
+    .saved button {
+      margin: 3px;
     }
   </style>
 </head>
 <body>
-  <h1>ESP32 11× 8x8 WS2812 Matrix Controller</h1>
+  <h1>Protogen MAX7219 Head</h1>
 
-  <div class="top">
-    <div class="hint">
-      Connect to WiFi <b>ESP32-Matrix-Control</b>, then open
-      <b>http://192.168.4.1:8080</b>
+  <div class="card">
+    <div class="small">
+      WiFi: <b>Protogen-Head</b> |
+      Web UI: <b>http://192.168.4.1:8080</b>
     </div>
-
-    <h3>Apply to all matrices</h3>
-
-    <label>Mode</label>
-    <select id="allMode">
-      <option value="off">Off</option>
-      <option value="solid">Solid</option>
-      <option value="rainbow">Rainbow</option>
-      <option value="checker">Checker</option>
-      <option value="wipe">Wipe</option>
-      <option value="custom">Custom / Paint</option>
-    </select>
-
-    <label>Color</label>
-    <input id="allColor" type="color" value="#ff0000">
-
-    <label>Brightness</label>
-    <input id="allBrightness" type="range" min="0" max="255" value="96">
-
-    <label>Animation speed, ms</label>
-    <input id="allSpeed" type="range" min="10" max="800" value="80">
-
-    <button onclick="applyAll()">Apply to all</button>
-    <button class="secondary" onclick="clearAll()">Clear custom pixels</button>
+    <div id="status" class="status"></div>
   </div>
 
-  <div id="cards" class="grid"></div>
+  <div class="card">
+    <h2>Animation</h2>
+
+    <div class="row">
+      <label>Name:</label>
+      <input id="animName" value="default_face" maxlength="31">
+
+      <label>FPS:</label>
+      <input id="fps" type="number" min="1" max="60" value="8">
+
+      <label>Brightness:</label>
+      <input id="intensity" type="range" min="0" max="15" value="3" oninput="setIntensity()">
+      <span id="intensityText">3</span>
+    </div>
+
+    <div class="row">
+      <button onclick="saveAnimation()">Save animation</button>
+      <button onclick="playCurrent()">Play saved</button>
+      <button class="secondary" onclick="stopPlayback()">Stop</button>
+      <button onclick="setDefault()">Set as power-on default</button>
+    </div>
+
+    <div class="small">
+      Name can only use letters, numbers, underscore, or dash.
+      Max frames in this firmware: 80.
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Saved Animations</h2>
+    <div id="savedList" class="saved"></div>
+  </div>
+
+  <div class="card">
+    <h2>Frame Editor</h2>
+
+    <div class="groups" id="groups"></div>
+
+    <div class="row">
+      <button id="drawBtn" class="active" onclick="setTool(1)">Draw</button>
+      <button id="eraseBtn" onclick="setTool(0)">Erase</button>
+      <button class="secondary" onclick="invertGroup()">Invert group</button>
+      <button class="secondary" onclick="clearGroup()">Clear group</button>
+      <button class="secondary" onclick="clearWholeFrame()">Clear whole frame</button>
+    </div>
+
+    <div id="grid" class="grid"></div>
+  </div>
+
+  <div class="card">
+    <h2>Frames</h2>
+
+    <div class="row">
+      <button onclick="addBlankFrame()">Add blank</button>
+      <button onclick="duplicateFrame()">Duplicate</button>
+      <button class="danger" onclick="deleteFrame()">Delete</button>
+      <button class="secondary" onclick="prevFrame()">Prev</button>
+      <button class="secondary" onclick="nextFrame()">Next</button>
+    </div>
+
+    <div id="frameList" class="frameList"></div>
+  </div>
 
 <script>
-let state = null;
+const NUM_MODULES = 14;
+const BYTES_PER_FRAME = 112;
 
-function post(path, data) {
-  return fetch(path, {
-    method: "POST",
-    headers: {"Content-Type": "application/x-www-form-urlencoded"},
-    body: new URLSearchParams(data)
+const GROUPS = [
+  { name: "Left Mouth",  modules: [0, 1, 2] },
+  { name: "Right Mouth", modules: [3, 4, 5] },
+
+  { name: "Left Eye",    modules: [6, 7] },
+  { name: "Right Eye",   modules: [8, 9] },
+
+  { name: "Left Ear",    modules: [10] },
+  { name: "Right Ear",   modules: [11] },
+
+  { name: "Left Nose",   modules: [12] },
+  { name: "Right Nose",  modules: [13] }
+];
+
+let frames = [new Uint8Array(BYTES_PER_FRAME)];
+let selectedFrame = 0;
+let selectedGroup = 0;
+let tool = 1;
+let mouseDown = false;
+let previewTimer = null;
+
+function status(msg) {
+  document.getElementById("status").textContent = msg;
+  setTimeout(() => {
+    if (document.getElementById("status").textContent === msg) {
+      document.getElementById("status").textContent = "";
+    }
+  }, 2500);
+}
+
+function isSafeName(name) {
+  return /^[A-Za-z0-9_-]{1,31}$/.test(name);
+}
+
+function byteToHex(b) {
+  return b.toString(16).padStart(2, "0").toUpperCase();
+}
+
+function frameToHex(frame) {
+  let out = "";
+  for (let i = 0; i < frame.length; i++) {
+    out += byteToHex(frame[i]);
+  }
+  return out;
+}
+
+function hexToFrame(hex) {
+  let frame = new Uint8Array(BYTES_PER_FRAME);
+
+  for (let i = 0; i < BYTES_PER_FRAME; i++) {
+    frame[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+
+  return frame;
+}
+
+function getPixel(frame, module, x, y) {
+  let idx = module * 8 + y;
+  let mask = 1 << (7 - x);
+  return (frame[idx] & mask) !== 0;
+}
+
+function setPixel(frame, module, x, y, value) {
+  let idx = module * 8 + y;
+  let mask = 1 << (7 - x);
+
+  if (value) {
+    frame[idx] |= mask;
+  } else {
+    frame[idx] &= ~mask;
+  }
+}
+
+function currentFrame() {
+  return frames[selectedFrame];
+}
+
+function sendPreviewDebounced() {
+  clearTimeout(previewTimer);
+
+  previewTimer = setTimeout(async () => {
+    let body = new URLSearchParams();
+    body.set("frame", frameToHex(currentFrame()));
+
+    await fetch("/api/preview", {
+      method: "POST",
+      body
+    });
+  }, 60);
+}
+
+function makeGroups() {
+  let el = document.getElementById("groups");
+  el.innerHTML = "";
+
+  GROUPS.forEach((g, i) => {
+    let b = document.createElement("button");
+    b.textContent = g.name;
+    b.className = i === selectedGroup ? "active" : "";
+    b.onclick = () => {
+      selectedGroup = i;
+      makeGroups();
+      drawGrid();
+    };
+    el.appendChild(b);
   });
 }
 
-function makePixelGrid(matrixIndex) {
-  let html = '<div class="pixels">';
+function drawGrid() {
+  let group = GROUPS[selectedGroup];
+  let width = group.modules.length * 8;
+  let grid = document.getElementById("grid");
+
+  grid.style.gridTemplateColumns = `repeat(${width}, 22px)`;
+  grid.innerHTML = "";
+
   for (let y = 0; y < 8; y++) {
-    for (let x = 0; x < 8; x++) {
-      html += `<div class="px" onclick="paintPixel(${matrixIndex},${x},${y})"></div>`;
+    for (let gx = 0; gx < width; gx++) {
+      let moduleIndex = Math.floor(gx / 8);
+      let localX = gx % 8;
+      let module = group.modules[moduleIndex];
+
+      let px = document.createElement("div");
+      px.className = "px";
+
+      if (getPixel(currentFrame(), module, localX, y)) {
+        px.classList.add("on");
+      }
+
+      function paint() {
+        setPixel(currentFrame(), module, localX, y, tool === 1);
+        drawGrid();
+        sendPreviewDebounced();
+      }
+
+      px.onmousedown = (e) => {
+        e.preventDefault();
+        mouseDown = true;
+        paint();
+      };
+
+      px.onmouseenter = () => {
+        if (mouseDown) paint();
+      };
+
+      px.ontouchstart = (e) => {
+        e.preventDefault();
+        mouseDown = true;
+        paint();
+      };
+
+      px.ontouchmove = (e) => {
+        e.preventDefault();
+
+        let touch = e.touches[0];
+        let target = document.elementFromPoint(touch.clientX, touch.clientY);
+
+        if (target && target.classList.contains("px")) {
+          target.dispatchEvent(new MouseEvent("mousedown"));
+        }
+      };
+
+      grid.appendChild(px);
     }
   }
-  html += '</div>';
-  return html;
 }
 
-function makeCard(i, s) {
-  return `
-    <div class="card">
-      <h3>Matrix ${i + 1}</h3>
+document.body.onmouseup = () => mouseDown = false;
+document.body.ontouchend = () => mouseDown = false;
 
-      <label>Mode</label>
-      <select id="mode${i}">
-        <option value="off">Off</option>
-        <option value="solid">Solid</option>
-        <option value="rainbow">Rainbow</option>
-        <option value="checker">Checker</option>
-        <option value="wipe">Wipe</option>
-        <option value="custom">Custom / Paint</option>
-      </select>
-
-      <label>Color</label>
-      <input id="color${i}" type="color" value="${s.color}">
-
-      <label>Brightness</label>
-      <input id="brightness${i}" type="range" min="0" max="255" value="${s.brightness}">
-
-      <label>Animation speed, ms</label>
-      <input id="speed${i}" type="range" min="10" max="800" value="${s.speed}">
-
-      <button onclick="applyMatrix(${i})">Apply</button>
-
-      <div class="hint">
-        Pixel painter uses this matrix's color. Clicking a pixel switches that matrix to custom mode.
-      </div>
-      ${makePixelGrid(i)}
-    </div>
-  `;
+function setTool(t) {
+  tool = t;
+  document.getElementById("drawBtn").className = t === 1 ? "active" : "";
+  document.getElementById("eraseBtn").className = t === 0 ? "active" : "";
 }
 
-async function loadState() {
-  const res = await fetch("/state");
-  state = await res.json();
+function clearGroup() {
+  let group = GROUPS[selectedGroup];
 
-  const cards = document.getElementById("cards");
-  cards.innerHTML = "";
-
-  for (let i = 0; i < state.matrices.length; i++) {
-    cards.innerHTML += makeCard(i, state.matrices[i]);
+  for (let module of group.modules) {
+    for (let y = 0; y < 8; y++) {
+      currentFrame()[module * 8 + y] = 0;
+    }
   }
 
-  for (let i = 0; i < state.matrices.length; i++) {
-    document.getElementById("mode" + i).value = state.matrices[i].mode;
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function invertGroup() {
+  let group = GROUPS[selectedGroup];
+
+  for (let module of group.modules) {
+    for (let y = 0; y < 8; y++) {
+      currentFrame()[module * 8 + y] ^= 0xFF;
+    }
+  }
+
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function clearWholeFrame() {
+  currentFrame().fill(0);
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function addBlankFrame() {
+  if (frames.length >= 80) {
+    status("Frame limit reached");
+    return;
+  }
+
+  frames.push(new Uint8Array(BYTES_PER_FRAME));
+  selectedFrame = frames.length - 1;
+  refreshFrames();
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function duplicateFrame() {
+  if (frames.length >= 80) {
+    status("Frame limit reached");
+    return;
+  }
+
+  let copy = new Uint8Array(currentFrame());
+  frames.splice(selectedFrame + 1, 0, copy);
+  selectedFrame++;
+  refreshFrames();
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function deleteFrame() {
+  if (frames.length <= 1) {
+    currentFrame().fill(0);
+  } else {
+    frames.splice(selectedFrame, 1);
+    selectedFrame = Math.max(0, selectedFrame - 1);
+  }
+
+  refreshFrames();
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function prevFrame() {
+  selectedFrame = Math.max(0, selectedFrame - 1);
+  refreshFrames();
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function nextFrame() {
+  selectedFrame = Math.min(frames.length - 1, selectedFrame + 1);
+  refreshFrames();
+  drawGrid();
+  sendPreviewDebounced();
+}
+
+function refreshFrames() {
+  let el = document.getElementById("frameList");
+  el.innerHTML = "";
+
+  frames.forEach((f, i) => {
+    let b = document.createElement("button");
+    b.textContent = i + 1;
+    b.className = "frameBtn" + (i === selectedFrame ? " active" : "");
+    b.onclick = () => {
+      selectedFrame = i;
+      refreshFrames();
+      drawGrid();
+      sendPreviewDebounced();
+    };
+    el.appendChild(b);
+  });
+}
+
+async function saveAnimation() {
+  let name = document.getElementById("animName").value.trim();
+  let fps = parseInt(document.getElementById("fps").value || "8");
+
+  if (!isSafeName(name)) {
+    status("Bad name. Use letters, numbers, underscore, or dash.");
+    return;
+  }
+
+  let data = {
+    name,
+    fps,
+    loop: true,
+    frames: frames.map(f => frameToHex(f))
+  };
+
+  let res = await fetch("/api/save", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(data)
+  });
+
+  status(await res.text());
+  await loadSavedList();
+}
+
+async function playCurrent() {
+  let name = document.getElementById("animName").value.trim();
+
+  if (!isSafeName(name)) {
+    status("Bad name");
+    return;
+  }
+
+  let body = new URLSearchParams();
+  body.set("name", name);
+
+  let res = await fetch("/api/play", {
+    method: "POST",
+    body
+  });
+
+  status(await res.text());
+  await loadSavedList();
+}
+
+async function stopPlayback() {
+  let res = await fetch("/api/stop", {method: "POST"});
+  status(await res.text());
+}
+
+async function setDefault() {
+  let name = document.getElementById("animName").value.trim();
+
+  if (!isSafeName(name)) {
+    status("Bad name");
+    return;
+  }
+
+  let body = new URLSearchParams();
+  body.set("name", name);
+
+  let res = await fetch("/api/default", {
+    method: "POST",
+    body
+  });
+
+  status(await res.text());
+  await loadSavedList();
+}
+
+async function loadAnimationByName(name) {
+  let res = await fetch("/api/load?name=" + encodeURIComponent(name));
+
+  if (!res.ok) {
+    status(await res.text());
+    return;
+  }
+
+  let data = await res.json();
+
+  document.getElementById("animName").value = data.name;
+  document.getElementById("fps").value = data.fps || 8;
+
+  frames = data.frames.map(hexToFrame);
+
+  if (frames.length === 0) {
+    frames = [new Uint8Array(BYTES_PER_FRAME)];
+  }
+
+  selectedFrame = 0;
+  refreshFrames();
+  drawGrid();
+  sendPreviewDebounced();
+
+  status("Loaded " + name);
+}
+
+async function deleteAnimationByName(name) {
+  if (!confirm("Delete animation " + name + "?")) return;
+
+  let body = new URLSearchParams();
+  body.set("name", name);
+
+  let res = await fetch("/api/delete", {
+    method: "POST",
+    body
+  });
+
+  status(await res.text());
+  await loadSavedList();
+}
+
+async function playAnimationByName(name) {
+  let body = new URLSearchParams();
+  body.set("name", name);
+
+  let res = await fetch("/api/play", {
+    method: "POST",
+    body
+  });
+
+  status(await res.text());
+  await loadSavedList();
+}
+
+async function defaultAnimationByName(name) {
+  let body = new URLSearchParams();
+  body.set("name", name);
+
+  let res = await fetch("/api/default", {
+    method: "POST",
+    body
+  });
+
+  status(await res.text());
+  await loadSavedList();
+}
+
+async function loadSavedList() {
+  let res = await fetch("/api/list");
+  let data = await res.json();
+
+  document.getElementById("intensity").value = data.intensity;
+  document.getElementById("intensityText").textContent = data.intensity;
+
+  let el = document.getElementById("savedList");
+  el.innerHTML = "";
+
+  if (data.animations.length === 0) {
+    el.innerHTML = "<div class='small'>No saved animations yet.</div>";
+    return;
+  }
+
+  for (let name of data.animations) {
+    let wrapper = document.createElement("div");
+    wrapper.className = "row";
+
+    let label = document.createElement("span");
+    label.textContent = name;
+
+    if (name === data.default) {
+      label.textContent += "  [power-on default]";
+    }
+
+    wrapper.appendChild(label);
+
+    let load = document.createElement("button");
+    load.textContent = "Load";
+    load.className = "secondary";
+    load.onclick = () => loadAnimationByName(name);
+    wrapper.appendChild(load);
+
+    let play = document.createElement("button");
+    play.textContent = "Play";
+    play.onclick = () => playAnimationByName(name);
+    wrapper.appendChild(play);
+
+    let def = document.createElement("button");
+    def.textContent = "Default";
+    def.onclick = () => defaultAnimationByName(name);
+    wrapper.appendChild(def);
+
+    let del = document.createElement("button");
+    del.textContent = "Delete";
+    del.className = "danger";
+    del.onclick = () => deleteAnimationByName(name);
+    wrapper.appendChild(del);
+
+    el.appendChild(wrapper);
   }
 }
 
-async function applyMatrix(i) {
-  await post("/set", {
-    m: i,
-    mode: document.getElementById("mode" + i).value,
-    color: document.getElementById("color" + i).value,
-    brightness: document.getElementById("brightness" + i).value,
-    speed: document.getElementById("speed" + i).value
+async function setIntensity() {
+  let value = document.getElementById("intensity").value;
+  document.getElementById("intensityText").textContent = value;
+
+  let body = new URLSearchParams();
+  body.set("value", value);
+
+  await fetch("/api/intensity", {
+    method: "POST",
+    body
   });
-  await loadState();
 }
 
-async function applyAll() {
-  await post("/set", {
-    m: "all",
-    mode: document.getElementById("allMode").value,
-    color: document.getElementById("allColor").value,
-    brightness: document.getElementById("allBrightness").value,
-    speed: document.getElementById("allSpeed").value
-  });
-  await loadState();
-}
-
-async function clearAll() {
-  await post("/clear", {});
-  await loadState();
-}
-
-async function paintPixel(m, x, y) {
-  const color = document.getElementById("color" + m).value;
-  await post("/pixel", {m, x, y, color});
-  document.getElementById("mode" + m).value = "custom";
-}
-
-loadState();
+makeGroups();
+refreshFrames();
+drawGrid();
+loadSavedList();
+sendPreviewDebounced();
 </script>
 </body>
 </html>
 )HTML";
 
-// ================= HELPERS =================
-
-uint16_t xyToIndex(uint8_t x, uint8_t y) {
-  if (x >= MATRIX_W || y >= MATRIX_H) return 0;
-
-#if SERPENTINE_MATRIX
-  if (y & 1) {
-    return y * MATRIX_W + (MATRIX_W - 1 - x);
-  } else {
-    return y * MATRIX_W + x;
-  }
-#else
-  return y * MATRIX_W + x;
-#endif
-}
-
-uint16_t matrixLedOffset(uint8_t matrix, uint8_t localIndex) {
-  return matrix * LEDS_PER_MATRIX + localIndex;
-}
-
-CRGB applyBrightness(CRGB c, uint8_t brightness) {
-  c.nscale8_video(brightness);
-  return c;
-}
-
-CRGB parseHexColor(String s) {
-  s.trim();
-  if (s.startsWith("#")) s.remove(0, 1);
-
-  if (s.length() != 6) {
-    return CRGB::White;
-  }
-
-  uint32_t value = strtoul(s.c_str(), nullptr, 16);
-  return CRGB(
-    (value >> 16) & 0xFF,
-    (value >> 8) & 0xFF,
-    value & 0xFF
-  );
-}
-
-String colorToHex(CRGB c) {
-  char buf[8];
-  snprintf(buf, sizeof(buf), "#%02X%02X%02X", c.r, c.g, c.b);
-  return String(buf);
-}
-
-const char *modeToString(LedMode mode) {
-  switch (mode) {
-    case MODE_OFF: return "off";
-    case MODE_SOLID: return "solid";
-    case MODE_RAINBOW: return "rainbow";
-    case MODE_CHECKER: return "checker";
-    case MODE_WIPE: return "wipe";
-    case MODE_CUSTOM: return "custom";
-    default: return "off";
-  }
-}
-
-LedMode stringToMode(String s) {
-  s.toLowerCase();
-
-  if (s == "solid") return MODE_SOLID;
-  if (s == "rainbow") return MODE_RAINBOW;
-  if (s == "checker") return MODE_CHECKER;
-  if (s == "wipe") return MODE_WIPE;
-  if (s == "custom") return MODE_CUSTOM;
-
-  return MODE_OFF;
-}
-
-void setMatrixPixel(uint8_t matrix, uint8_t x, uint8_t y, CRGB color) {
-  if (matrix >= NUM_MATRICES || x >= MATRIX_W || y >= MATRIX_H) return;
-
-  uint16_t localIndex = xyToIndex(x, y);
-  uint16_t globalIndex = matrixLedOffset(matrix, localIndex);
-
-  leds[globalIndex] = applyBrightness(color, matrixState[matrix].brightness);
-}
-
-void fillMatrix(uint8_t matrix, CRGB color) {
-  if (matrix >= NUM_MATRICES) return;
-
-  CRGB out = applyBrightness(color, matrixState[matrix].brightness);
-
-  for (uint8_t i = 0; i < LEDS_PER_MATRIX; i++) {
-    leds[matrixLedOffset(matrix, i)] = out;
-  }
-}
-
-void renderMatrix(uint8_t matrix) {
-  if (matrix >= NUM_MATRICES) return;
-
-  MatrixState &s = matrixState[matrix];
-
-  switch (s.mode) {
-    case MODE_OFF:
-      fillMatrix(matrix, CRGB::Black);
-      break;
-
-    case MODE_SOLID:
-      fillMatrix(matrix, s.color);
-      break;
-
-    case MODE_RAINBOW: {
-      for (uint8_t y = 0; y < MATRIX_H; y++) {
-        for (uint8_t x = 0; x < MATRIX_W; x++) {
-          uint8_t hue = frameCounter[matrix] * 3 + x * 12 + y * 8 + matrix * 18;
-          CRGB c;
-          hsv2rgb_rainbow(CHSV(hue, 255, 255), c);
-          setMatrixPixel(matrix, x, y, c);
-        }
-      }
-      break;
-    }
-
-    case MODE_CHECKER: {
-      for (uint8_t y = 0; y < MATRIX_H; y++) {
-        for (uint8_t x = 0; x < MATRIX_W; x++) {
-          bool on = ((x + y + frameCounter[matrix]) & 1) == 0;
-          setMatrixPixel(matrix, x, y, on ? s.color : CRGB::Black);
-        }
-      }
-      break;
-    }
-
-    case MODE_WIPE: {
-      uint8_t count = frameCounter[matrix] % (LEDS_PER_MATRIX + 1);
-
-      for (uint8_t i = 0; i < LEDS_PER_MATRIX; i++) {
-        leds[matrixLedOffset(matrix, i)] =
-          i < count ? applyBrightness(s.color, s.brightness) : CRGB::Black;
-      }
-      break;
-    }
-
-    case MODE_CUSTOM: {
-      for (uint8_t i = 0; i < LEDS_PER_MATRIX; i++) {
-        leds[matrixLedOffset(matrix, i)] =
-          applyBrightness(customPixels[matrix][i], s.brightness);
-      }
-      break;
-    }
-  }
-}
-
-void updateAnimations() {
-  uint32_t now = millis();
-  bool needShow = false;
-
-  for (uint8_t m = 0; m < NUM_MATRICES; m++) {
-    bool animated =
-      matrixState[m].mode == MODE_RAINBOW ||
-      matrixState[m].mode == MODE_CHECKER ||
-      matrixState[m].mode == MODE_WIPE;
-
-    if (matrixState[m].dirty || (animated && now - lastDrawMs[m] >= matrixState[m].speedMs)) {
-      if (animated) {
-        frameCounter[m]++;
-      }
-
-      renderMatrix(m);
-      matrixState[m].dirty = false;
-      lastDrawMs[m] = now;
-      needShow = true;
-    }
-  }
-
-  if (needShow) {
-    FastLED.show();
-  }
-}
-
-// ================= HTTP HANDLERS =================
-
 void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-void handleState() {
-  String json;
-  json.reserve(1600);
+// =====================================================
+// ANIMATION LOOP
+// =====================================================
 
-  json += "{\"count\":";
-  json += NUM_MATRICES;
-  json += ",\"matrices\":[";
-
-  for (uint8_t i = 0; i < NUM_MATRICES; i++) {
-    if (i > 0) json += ",";
-
-    json += "{";
-    json += "\"mode\":\"";
-    json += modeToString(matrixState[i].mode);
-    json += "\",\"color\":\"";
-    json += colorToHex(matrixState[i].color);
-    json += "\",\"brightness\":";
-    json += matrixState[i].brightness;
-    json += ",\"speed\":";
-    json += matrixState[i].speedMs;
-    json += "}";
-  }
-
-  json += "]}";
-
-  server.send(200, "application/json", json);
-}
-
-void applyArgsToMatrix(uint8_t m) {
-  if (m >= NUM_MATRICES) return;
-
-  if (server.hasArg("mode")) {
-    matrixState[m].mode = stringToMode(server.arg("mode"));
-  }
-
-  if (server.hasArg("color")) {
-    matrixState[m].color = parseHexColor(server.arg("color"));
-  }
-
-  if (server.hasArg("brightness")) {
-    int b = server.arg("brightness").toInt();
-    matrixState[m].brightness = constrain(b, 0, 255);
-  }
-
-  if (server.hasArg("speed")) {
-    int spd = server.arg("speed").toInt();
-    matrixState[m].speedMs = constrain(spd, 10, 2000);
-  }
-
-  matrixState[m].dirty = true;
-}
-
-void handleSet() {
-  if (!server.hasArg("m")) {
-    server.send(400, "text/plain", "Missing m");
+void updateAnimation() {
+  if (!animPlaying || animFrameCount == 0) {
     return;
   }
 
-  String target = server.arg("m");
+  uint32_t now = millis();
 
-  if (target == "all") {
-    for (uint8_t m = 0; m < NUM_MATRICES; m++) {
-      applyArgsToMatrix(m);
-    }
-  } else {
-    int m = target.toInt();
-    if (m < 0 || m >= NUM_MATRICES) {
-      server.send(400, "text/plain", "Bad matrix number");
-      return;
-    }
-
-    applyArgsToMatrix((uint8_t)m);
-  }
-
-  updateAnimations();
-  server.send(200, "text/plain", "OK");
-}
-
-void handlePixel() {
-  if (!server.hasArg("m") || !server.hasArg("x") || !server.hasArg("y") || !server.hasArg("color")) {
-    server.send(400, "text/plain", "Missing m, x, y, or color");
+  if (now - lastAnimMs < animFrameMs) {
     return;
   }
 
-  int m = server.arg("m").toInt();
-  int x = server.arg("x").toInt();
-  int y = server.arg("y").toInt();
+  lastAnimMs = now;
 
-  if (m < 0 || m >= NUM_MATRICES || x < 0 || x >= MATRIX_W || y < 0 || y >= MATRIX_H) {
-    server.send(400, "text/plain", "Bad pixel coordinate");
-    return;
-  }
+  memcpy(displayFrame, animFrames[animIndex], BYTES_PER_FRAME);
+  maxShowFrame(displayFrame);
 
-  CRGB c = parseHexColor(server.arg("color"));
-  uint16_t localIndex = xyToIndex((uint8_t)x, (uint8_t)y);
+  animIndex++;
 
-  customPixels[m][localIndex] = c;
-  matrixState[m].mode = MODE_CUSTOM;
-  matrixState[m].dirty = true;
-
-  updateAnimations();
-  server.send(200, "text/plain", "OK");
-}
-
-void handleClear() {
-  for (uint8_t m = 0; m < NUM_MATRICES; m++) {
-    for (uint8_t i = 0; i < LEDS_PER_MATRIX; i++) {
-      customPixels[m][i] = CRGB::Black;
+  if (animIndex >= animFrameCount) {
+    if (animLoop) {
+      animIndex = 0;
+    } else {
+      animIndex = animFrameCount - 1;
+      animPlaying = false;
     }
-
-    matrixState[m].dirty = true;
   }
-
-  updateAnimations();
-  server.send(200, "text/plain", "OK");
 }
 
-void handleNotFound() {
-  server.send(404, "text/plain", "Not found");
-}
-
-// ================= SETUP / LOOP =================
+// =====================================================
+// SETUP / LOOP
+// =====================================================
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(500);
 
   Serial.println();
-  Serial.println("Booting ESP32 LED matrix controller...");
+  Serial.println("Booting Protogen MAX7219 controller...");
 
-  for (uint8_t m = 0; m < NUM_MATRICES; m++) {
-    matrixState[m].mode = MODE_OFF;
-    matrixState[m].color = CRGB::Red;
-    matrixState[m].brightness = 96;
-    matrixState[m].speedMs = 80;
-    matrixState[m].dirty = true;
+  maxInit();
 
-    lastDrawMs[m] = 0;
-    frameCounter[m] = 0;
-
-    for (uint8_t i = 0; i < LEDS_PER_MATRIX; i++) {
-      customPixels[m][i] = CRGB::Black;
-    }
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed.");
+  } else {
+    Serial.println("LittleFS mounted.");
   }
 
-  FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, TOTAL_LEDS);
-  FastLED.setCorrection(TypicalLEDStrip);
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_POWER_MILLIAMPS);
-  FastLED.clear(true);
+  loadDefaultName();
+
+  WiFi.disconnect(true);
+  delay(300);
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
 
-  IPAddress ip = WiFi.softAPIP();
+  IPAddress localIP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
 
-  Serial.print("WiFi AP SSID: ");
+  WiFi.softAPConfig(localIP, gateway, subnet);
+
+  bool apStarted = WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+
+  Serial.print("AP started: ");
+  Serial.println(apStarted ? "YES" : "NO");
+  Serial.print("SSID: ");
   Serial.println(AP_SSID);
+  Serial.print("Password: ");
+  Serial.println(AP_PASS);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
   Serial.print("Web UI: http://");
-  Serial.print(ip);
+  Serial.print(WiFi.softAPIP());
   Serial.print(":");
   Serial.println(WEB_PORT);
 
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/state", HTTP_GET, handleState);
-  server.on("/set", HTTP_POST, handleSet);
-  server.on("/pixel", HTTP_POST, handlePixel);
-  server.on("/clear", HTTP_POST, handleClear);
-  server.onNotFound(handleNotFound);
+
+  server.on("/test", HTTP_GET, []() {
+    server.send(200, "text/plain", "ESP32 MAX7219 HTTP server works");
+  });
+
+  server.on("/api/list", HTTP_GET, handleApiList);
+  server.on("/api/load", HTTP_GET, handleApiLoad);
+
+  server.on("/api/save", HTTP_POST, handleApiSave);
+  server.on("/api/play", HTTP_POST, handleApiPlay);
+  server.on("/api/stop", HTTP_POST, handleApiStop);
+  server.on("/api/default", HTTP_POST, handleApiDefault);
+  server.on("/api/delete", HTTP_POST, handleApiDelete);
+  server.on("/api/preview", HTTP_POST, handleApiPreview);
+  server.on("/api/intensity", HTTP_POST, handleApiIntensity);
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
 
   server.begin();
-  Serial.println("HTTP server started on port 8080.");
 
-  updateAnimations();
+  Serial.println("HTTP server started.");
+
+  if (defaultAnimName.length() > 0 && loadAnimation(defaultAnimName)) {
+    animPlaying = true;
+    Serial.print("Loaded default animation: ");
+    Serial.println(defaultAnimName);
+  } else {
+    memset(displayFrame, 0, BYTES_PER_FRAME);
+    maxShowFrame(displayFrame);
+    Serial.println("No default animation loaded.");
+  }
 }
 
 void loop() {
   server.handleClient();
-  updateAnimations();
+  updateAnimation();
 }
